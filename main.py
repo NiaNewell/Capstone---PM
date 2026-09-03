@@ -120,9 +120,6 @@ if __name__ == "__main__":
             print("Recovery Key Not Initialized")
             exit()     
 
-    if not validate_usb():
-        print("ACCESS DENIED!")
-        exit()
 
     # ENTRANCE TO PASSWORD MANAGER
     print("=== PASSWORD MANAGER ===")
@@ -133,6 +130,10 @@ if __name__ == "__main__":
     choice = input("> ")
 
     if choice == "1":
+        if not validate_usb():
+            print("ACCESS DENIED!")
+            exit()
+            
         fernet = login()
 
         if not fernet:

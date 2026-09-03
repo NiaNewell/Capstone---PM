@@ -182,7 +182,7 @@ def change_usb_pin():
         pin2 = getpass.getpass("Confirm New USB PIN: ")
 
         if pin != pin2:
-            print("Passwords do not match.")
+            print("PINs do not match.")
             continue
         break
 
@@ -194,7 +194,7 @@ def change_usb_pin():
         return False
 
     try:
-        with open(usb_path, "w", encoding="utf-8") as f:
+        with open(usb_path, "r", encoding="utf-8") as f:
             usb_secret = f.read().strip()
     except (FileNotFoundError, PermissionError, OSError) as e:
         print(f"Failed to read USB key: {e}")
