@@ -10,7 +10,7 @@ Status: v1 CLI functional. Cryptographic core being restructured. Currently only
 ## ABOUT V1:  
 Self-auditing found that storing the derived vault key in the master.json verifier field was too insecure— anyone holding that single file can decrypt the vault without supplying any authentication factor. This invalidated the key-derivation design, so the core is being rebuilt around a wrapped-key architecture before the API work begins.
 The full v2 design and threat model:
-[`docs/vault-key-recovery-spec.md`](docs/vault-key-recovery-spec.md)
+[`vault-key-recovery-spec.md`](vault-key-recovery-spec.md)
 
 
 ## Why Self-Hosted:
