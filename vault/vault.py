@@ -103,11 +103,15 @@ def view_category(vault, category):
                 
 
 def add_credential(vault, fernet):
+    if not vault["groups"]:
+        print("No Groups have been created yet.")
+        pause()
+        return
+
     print("Available Groups:") 
     for g in vault["groups"]: 
         print("-", g)
 
-   
     group = input("Enter Category Name\n").strip().lower()
 
     while group not in vault["groups"]:
@@ -188,7 +192,7 @@ def delete_credential(vault, fernet):
             pause()
             return
 
-        deleted = entries.pop(site)
+        entries.pop(site)
         save_vault(vault, fernet)
         print(f"Credential for {site} deleted.")
         pause()

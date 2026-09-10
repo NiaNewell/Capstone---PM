@@ -1,85 +1,80 @@
-import json, hmac, base64, string
-import getpass
-import os
+import json, base64, string
+import getpass, os, secrets
 from auth.session import session
-from USB.usb_auth import find_file_usb
-from crypto.crypto_utils import derive_fernet_key
+from auth.slots import rewrite_slots
+from crypto.crypto_utils import generate_vk, derive_kek, unwrap
 from cryptography.fernet import Fernet
-from config import MASTER_JSON, VAULT_FILE
-import time
+from config import MASTER_JSON
+from datetime import datetime, timezone
+from vault.vault import save_vault
+from USB.usb_installer import wrap_store_secret, read_unwrap_secret
 
 #Master Password Set-up
 def setup_master_password():
-    print("=== First-Time Setup ===")
+    pw1 = get_confirm_pass()
+    pin = get_confirm_pin()
 
-    while True:
-        pw1 = getpass.getpass("Create master password: ")
-        pw2 = getpass.getpass("Confirm master password: ")
+    vault_key = generate_vk()
+    usb_secret = os.urandom(32)
 
-        error = validate_pass(pw1)
-
-        if error:
-            print(error)
-            continue
-
-        if pw1 != pw2:
-            print("Passwords do not match.")
-            continue
-
-        break
-
-    # Locates USB secret file and pulls path
-    usb_path, _ = find_file_usb()
-
-    if not usb_path:
-        print("USB secret file not found.")
+    # Writes pm_install.key to USB drive
+    if not wrap_store_secret(usb_secret, pin):
+        print("Setup failed: USB not found.")
         return False
 
-    with open(usb_path, "r", encoding="utf-8") as f:
-        usb_secret = f.read().strip()
+    recovery_key = secrets.token_hex(16)
+    created = datetime.now(timezone.utc).isoformat()
+    rewrite_slots(vault_key, pw1, usb_secret, recovery_key, created)
 
-    # Scrypt parameters
-    n, r, p = 2**14, 8, 1
-    salt = os.urandom(16)
+    fernet = Fernet(base64.urlsafe_b64encode(vault_key))
+    save_vault({"groups": {}}, fernet)
 
-    # Derive encryption key (using master pass, USB data, salt and kdf param)
-    fkey = derive_fernet_key(pw1, usb_secret, salt, n, r, p)
-    
-    #Data to be stored in json file
-    master_record = {
-        "kdf": {"n": n, "r": r, "p": p},
-        "salt": base64.b64encode(salt).decode(),
-        "verifier": fkey.decode()
-    }
-
-    with open(MASTER_JSON, "w") as f:
-        json.dump(master_record, f, indent=2)
-
-    # Initialize encrypted vault
-    vault = Fernet(fkey).encrypt(json.dumps({"groups": {}}).encode())
-
-    with open(VAULT_FILE, "wb") as f:
-        f.write(vault)
-
-    print("Master password set.")
-    return True
+    return (recovery_key)
 
 
 def login():
-    fernet = verify_masterpass()
+    usb_secret = read_unwrap_secret()
+    if usb_secret is None:
+        return None
 
-    if not fernet:
+    master = json.load(open(MASTER_JSON))
+    slot = master["slots"]["normal"]
+
+    for attempt in range(3):
+        pw = getpass.getpass("Enter master password: ")
+
+        if verify_master_password(pw, usb_secret):
+
+            salt = base64.b64decode(slot["salt"])
+            kdf = master["kdf"]
+            kek = derive_kek(pw.encode(), usb_secret, salt, kdf["n"], kdf["r"], kdf["p"])
+
+            vault_key = unwrap(kek, base64.b64decode(slot["wrapped_key"]), slot["aad"])
+
+            session.start(vault_key, usb_secret)
+
+            return Fernet(base64.urlsafe_b64encode(vault_key))
+        
+        print("Authentication failed.")
+
+    return None
+
+
+def verify_master_password(master_password, usb_secret):
+
+    master = json.load(open(MASTER_JSON))
+    slot = master["slots"]["normal"]
+    salt = base64.b64decode(slot["salt"])
+    kdf = master["kdf"]
+
+    kek = derive_kek(master_password.encode(), usb_secret, salt, kdf["n"], kdf["r"], kdf["p"])
+
+    try:
+        unwrap(kek, base64.b64decode(slot["wrapped_key"]), slot["aad"])
+        return True
+    
+    except Exception:
         return False
-
-    print("Access granted.")
-    session.authenticated = True
-    session.login_time = time.time()
-    session.auth_method = "usb+master_password"
-
-    return fernet 
-
-
-
 
 def validate_pass(password):
     if len(password) < 8:
@@ -100,53 +95,34 @@ def validate_pass(password):
     return None
 
 
-def verify_masterpass():
-    try:
-        with open(MASTER_JSON, "r") as f:
-            master = json.load(f)
+def get_confirm_pass():
+    while True:
+        pw1 = getpass.getpass("Create master password: ")
+        pw2 = getpass.getpass("Confirm master password: ")
 
-    except FileNotFoundError:
-        print("Missing or corrupted master.json")
-        return None
-    
-    except json.JSONDecodeError:
-        print("master.json is corrupted.")
-        return None
-    
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        return None
+        error = validate_pass(pw1)
 
-    kdf = master["kdf"]
-    n, r, p = kdf["n"], kdf["r"], kdf["p"]
+        if error:
+            print(error)
+            continue
 
-    salt = base64.b64decode(master["salt"])
-    stored_verifier = master["verifier"].encode()
-
-    # Locate USB secret file
-    usb_path, _ = find_file_usb()
-
-    if not usb_path:
-        print("USB not found.")
-        return None
-
-    with open(usb_path, "r", encoding="utf-8") as f:
-        usb_secret = f.read().strip()
-
-    # Allow up to 3 password attempts
-    for attempt in range(3):
+        if pw1 != pw2:
+            print("Passwords do not match.")
+            continue
         
-        pw = getpass.getpass("Enter master password: ")
-        
-        key = derive_fernet_key(pw, usb_secret, salt, n, r, p)
+        return pw1
 
-    # Checks if derived key matches stored key before session authentication
-        if hmac.compare_digest(key, stored_verifier):
-            return Fernet(key)
+def get_confirm_pin():
+    while True: 
+        pin = getpass.getpass("Create USB PIN: ")
 
-        print("Incorrect Master Password.")
+        if not pin.isdigit() or len(pin) < 6:
+            print("PIN must be at least 6 digits.")
+            continue
 
-    print("Too many incorrect password attempts. Access Denied.")
-    return False  
+        pin2 = getpass.getpass("Confirm USB PIN: ")
+        if pin != pin2:
+            print("PINs do not match.")
+            continue
 
-    
+        return pin

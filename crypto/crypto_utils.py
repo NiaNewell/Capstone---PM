@@ -1,4 +1,4 @@
-import base64, os
+import base64, os, json, tempfile
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -27,3 +27,15 @@ def unwrap(kek: bytes, data: bytes, aad: str) -> bytes:
     return aesgcm.decrypt(nonce, ciphertext, aad.encode())
 
 
+def write_json(path: str, data: dict):
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir = dir_name)
+    try: 
+        with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+        os.replace(tmp_path, path)  # atomic on the same filesystem
+    except Exception:
+        os.remove(tmp_path)
+        raise

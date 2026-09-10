@@ -1,225 +1,71 @@
-import getpass, base64, json, os, hmac
-import secrets, time
+import secrets, getpass
+from datetime import datetime, timezone
 from cryptography.fernet import Fernet
-from USB.usb_auth import find_file_usb
-from USB.usb_installer import derive_usb_hash
-from auth.auth import validate_pass, verify_masterpass
+from USB.usb_installer import wrap_store_secret
+from auth.auth import get_confirm_pin, get_confirm_pass, verify_master_password
 from auth.session import session
-from crypto.crypto_utils import derive_fernet_key, derive_recovery_verifier
-from config import MASTER_JSON
-from vault.vault import load_vault, save_vault
+from auth.slots import rewrite_slots
 
 def change_masterpass():
-    try:
-        with open(MASTER_JSON, "r") as f:
-            master = json.load(f)
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        return None
-    
-    
-    print("=== Update Master Password ===\n\n")
+    vault_key = session.vault_key
+    usb_secret = session.usb_secret
 
-    for i in range(3):
-        pw1 = getpass.getpass("Enter current master password: ")
-        
-        usb_path, _ = find_file_usb()
+    if vault_key is None or usb_secret is None:
+        return False
 
-        if not usb_path:
-            print("USB not found.")
-            return False
+    # Re-authenticate before changing Master Password
+    for attempt in range(3):
+        current_password = getpass.getpass("Enter current master password: ")
 
-        try:
-            with open(usb_path, "r", encoding="utf-8") as f:
-                usb_secret = f.read().strip()
-        except OSError:
-            print("Unable to read USB key.")
-            return False
-
-        kdf = master["kdf"]
-        n, r, p = kdf["n"], kdf["r"], kdf["p"]
-
-        salt = base64.b64decode(master["salt"])
-        stored_verifier = master["verifier"].encode()
-
-        key = derive_fernet_key(pw1, usb_secret, salt, n, r, p)
-
-        if not hmac.compare_digest(key, stored_verifier):
-            print("Incorrect password. \n")
-            continue
-
-        old_fernet = Fernet(key)
-        vault_data = load_vault(old_fernet)
-
-        if vault_data is None:
-            print("Failed to load vault.")
-            return False
-        
-        while True:
-            pw2 = getpass.getpass("Enter New Master Password: \n")
-            pw3 = getpass.getpass("Re-enter New Master Password: \n")
-
-            error = validate_pass(pw2)
-
-            if error:
-                print(error)
-                continue
-
-            if pw2 != pw3:
-                print("Passwords do not match.")
-                continue
+        if verify_master_password(current_password, usb_secret):
             break
 
+        print("Authentication failed.")
 
-        # Prevent reusing current master password
-        old_key = derive_fernet_key(pw2, usb_secret, salt, n, r, p)
+        if attempt == 2:
+            print("Too many failed attempts.")
+            return False
 
-        if hmac.compare_digest(old_key, stored_verifier):
-            print("New password must be different from the current password.")
-            continue
+    new_password = get_confirm_pass()
 
-        
-        new_salt = os.urandom(16)
-        new_key = derive_fernet_key(pw2, usb_secret, new_salt, n, r, p)
+    new_rk = secrets.token_hex(16)
+    created = datetime.now(timezone.utc).isoformat()
 
-        new_fernet = Fernet(new_key)
-        save_vault(vault_data, new_fernet)
+    rewrite_slots(vault_key, new_password, usb_secret, new_rk, created)
+    
+    return new_rk
 
-        master["salt"] = base64.b64encode(new_salt).decode()
-        master["verifier"] = new_key.decode()
-
-        with open(MASTER_JSON, "w") as f:
-            json.dump(master, f, indent=2)
-
-        print("Master password updated successfully.")
-        pw1 = None
-        pw2 = None
-        pw3 = None
-        usb_secret = None
-        return True
-
-
-    print("Too many failed attempts.")
-    pw1 = None
-    pw2 = None
-    pw3 = None
-    usb_secret = None
-    return False
-
-def generate_recovery_key():
-    recovery_key = secrets.token_hex(16)
-    salt = os.urandom(24)
-    n, r, p = 2**14, 8, 1
-
-    verifierhash = derive_recovery_verifier(recovery_key, salt, n, r, p)
-
-    recovery_record = {
-        "kdf": {"n": n, "r": r, "p": p},
-        "salt": base64.b64encode(salt).decode(),
-        "verifier":  base64.b64encode(verifierhash).decode()
-    }
-
-    with open(MASTER_JSON, "r") as f:
-        master = json.load(f)     
-
-    master["recovery"] = recovery_record
-
-    with open(MASTER_JSON, "w") as f:
-        json.dump(master, f, indent=2)
-
-
-    print("\n" + "=" * 50)
-    print("                 RECOVERY KEY")
-    print("=" * 50)
-    print(f"\n    {recovery_key}\n")
-    print("IMPORTANT:")
-    print("    This key will only be displayed once.")
-    print("    Store it somewhere secure.")
-    print("=" * 50 + "\n")
-
-    return recovery_key
-
-
-def validate_recovery():
-    with open(MASTER_JSON, "r") as f:
-        master = json.load(f)
-
-    recovery_param = master["recovery"]
-
-    stored_verifier = base64.b64decode(recovery_param["verifier"])
-    # stored_verifier = master["recovery"["verifier"]].encode()
-    salt = base64.b64decode(recovery_param["salt"])
-
-    kdf = recovery_param["kdf"]
-    n, r, p = kdf["n"], kdf["r"], kdf["p"]
-
-
-    for attempt in range(3):
-        recovery_code = input("Enter Recovery Key to Access Account:")
-
-        key = derive_recovery_verifier(recovery_code, salt, n, r, p)
-
-        if hmac.compare_digest(key, stored_verifier):
-            print("Recovery Key Validated.")
-            session.authenticated = True
-            session.login_time = time.time()
-            return True
-
-        print("Invalid Recovery Key")
-
-    print("Too many failed Recovery Attempts. Exiting")
-    return False
 
 def change_usb_pin():
-    # Loop until user provides matching PINs or an error occurs
-    while True:
-        pin = getpass.getpass("Enter New USB PIN: ")
+    vault_key = session.vault_key
+    usb_secret = session.usb_secret
 
-        if not pin.isdigit() or len(pin) < 4:
-            print("PIN must be at least 4 digits.")
-            continue
+    if vault_key is None or usb_secret is None:
+        return False
+
+    # Re-authenticate before changing PIN
+    for attempt in range(3):
+        masterpass = getpass.getpass("Enter current master password: ")
+
+        if verify_master_password(masterpass, usb_secret):
+            break
+
+        print("Authentication failed.")
+
+        if attempt == 2:
+            print("Too many failed attempts.")
+            return False
+
+    new_pin = get_confirm_pin()
+   
+    if not wrap_store_secret(usb_secret, new_pin):
+        print("Failed to update USB PIN.")
+        return False
+
+    new_rk = secrets.token_hex(16)
+    created = datetime.now(timezone.utc).isoformat()
+
+    rewrite_slots(vault_key, masterpass, usb_secret, new_rk, created)
     
-        pin2 = getpass.getpass("Confirm New USB PIN: ")
-
-        if pin != pin2:
-            print("PINs do not match.")
-            continue
-        break
-
-# Attempt to locate USB key file
-    usb_path, _ = find_file_usb()
-
-    if not usb_path:
-        print("USB not found.")
-        return False
-
-    try:
-        with open(usb_path, "r", encoding="utf-8") as f:
-            usb_secret = f.read().strip()
-    except (FileNotFoundError, PermissionError, OSError) as e:
-        print(f"Failed to read USB key: {e}")
-        return False
-
-
-    if len(usb_secret) < 32:
-        print("Invalid USB key.")
-        return False            
-
-    salt = os.urandom(16)
-#Derivation of new key using new PIN
-    derived = derive_usb_hash(usb_secret, pin, salt)
-
-    record = {
-        "salt": base64.b64encode(salt).decode(),
-        "hash": base64.b64encode(derived).decode()
-    }
-
-    with open("install_usb.hash", "w") as f:
-        json.dump(record, f, indent=2)
-
-    print("USB installation complete.")
-    return True
-
-
-
+    return new_rk
 
